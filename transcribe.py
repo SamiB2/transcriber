@@ -383,6 +383,8 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         self._q: queue.Queue = queue.Queue()
         self._dl_queue: queue.Queue = queue.Queue()
         self._model: WhisperModel | None = None
+        self._loading = False
+        self._connecting = False
 
         # session: notes, attachments, and the combined timeline exported to markdown
         self._session_dir: Path | None = None
@@ -819,17 +821,36 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
 
         self._btn.config(state="disabled")
         self._set_status(f"Loading '{model_name}' model…")
+        self._loading = True
+        # If nothing (cache hit) has resolved this quickly, the model is likely
+        # downloading — but real per-file byte progress only starts once the
+        # connection is established. Give visible feedback before that, since a
+        # slow/blocked connection (flaky wifi, VPN, antivirus TLS inspection)
+        # can stall there for a long time with zero signal otherwise.
+        self.after(1500, lambda: self._maybe_start_connecting(model_name))
 
         def load():
-            # Re-use cached model when name hasn't changed
-            if self._model is None or getattr(self._model, "_name", "") != model_name:
-                _install_download_progress_hook(self._dl_queue)
-                m = WhisperModel(model_name, device="cpu", compute_type="int8")
-                m._name = model_name  # type: ignore[attr-defined]
-                self._model = m
+            try:
+                # Re-use cached model when name hasn't changed
+                if self._model is None or getattr(self._model, "_name", "") != model_name:
+                    _install_download_progress_hook(self._dl_queue)
+                    m = WhisperModel(model_name, device="cpu", compute_type="int8")
+                    m._name = model_name  # type: ignore[attr-defined]
+                    self._model = m
+            except Exception as e:
+                self.after(0, lambda: self._load_failed(str(e)))
+                return
             self.after(0, lambda: self._launch(mic_srcs, mic_labels, spk_srcs, spk_labels))
 
         threading.Thread(target=load, daemon=True).start()
+
+    def _load_failed(self, message: str):
+        self._loading = False
+        self._stop_connecting_indicator()
+        self._dl_bar.pack_forget()
+        self._btn.config(state="normal", text="▶  Start", bootstyle="success")
+        self._set_status("")
+        self._log(f"Could not load model: {message}", "ERR")
 
     def _launch(
         self,
@@ -838,6 +859,9 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         spk_srcs: list[str],
         spk_labels: dict[str, str],
     ):
+        self._loading = False
+        self._stop_connecting_indicator()
+
         pairs = [(src, mic_labels[src], MIC_PALETTE, True) for src in mic_srcs]
         pairs += [(src, spk_labels[src], SPEAKER_PALETTE, False) for src in spk_srcs]
         for src, label, palette, is_mic in pairs:
@@ -883,6 +907,7 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
             while True:
                 done, total = self._dl_queue.get_nowait()
                 if total:
+                    self._stop_connecting_indicator()  # real byte progress beats the "connecting" guess
                     pct = min(100, done * 100 / total)
                     if not self._dl_bar.winfo_ismapped():
                         self._dl_bar.pack(fill="x")
@@ -895,6 +920,31 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         except queue.Empty:
             pass
         self.after(150, self._poll_downloads)
+
+    def _maybe_start_connecting(self, model_name: str):
+        if self._loading and not self._dl_bar.winfo_ismapped():
+            self._connecting = True
+            self._connect_started = time.monotonic()
+            self._dl_bar.mode = "indeterminate"  # a plain attribute on this widget, not a Tk option
+            self._dl_bar.start()
+            self._dl_bar.pack(fill="x")
+            self._tick_connecting(model_name)
+
+    def _tick_connecting(self, model_name: str):
+        if not self._connecting:
+            return
+        elapsed = int(time.monotonic() - self._connect_started)
+        self._set_status(
+            f"Loading '{model_name}' model… still working ({elapsed}s) — "
+            "if this hangs, check that a VPN or antivirus isn't blocking the connection"
+        )
+        self.after(1000, lambda: self._tick_connecting(model_name))
+
+    def _stop_connecting_indicator(self):
+        if self._connecting:
+            self._connecting = False
+            self._dl_bar.stop()
+            self._dl_bar.mode = "determinate"
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
