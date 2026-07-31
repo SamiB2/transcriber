@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --onefile --windowed --name Transcriber --collect-all tkinterdnd2 --collect-all ctranslate2 --collect-all faster_whisper transcribe.py
+      - run: pyinstaller --onefile --windowed --name Transcriber --collect-all tkinterdnd2 --collect-all ctranslate2 --collect-all faster_whisper --collect-all ttkbootstrap --collect-all certifi transcribe.py
       - uses: actions/upload-artifact@v4
         with:
           name: Transcriber-windows
