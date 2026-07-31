@@ -1,0 +1,13 @@
+# Install system packages first (once):
+#   sudo apt install python3.12-venv python3-tk -y
+#
+# Then set up the venv:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+
+faster-whisper
+numpy
+ttkbootstrap
+tkinterdnd2
+sounddevice; platform_system == "Windows"
