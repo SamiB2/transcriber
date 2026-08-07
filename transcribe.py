@@ -51,9 +51,11 @@ MD_PREAMBLE = """\
 >   session to flag something worth keeping — treat these as higher-signal
 >   than the surrounding ASR text, and use them to guide what's important.
 > - **Attachments** are files the user dropped in during the session,
->   copied into `assets/` next to this file. A Note or Timeline line may
->   link to one inline (`[name](assets/name)`) — that means the file is
->   directly relevant to what's being said at that timestamp."""
+>   copied into `assets/` next to this file. Each one gets a **📎 Attachment**
+>   Timeline entry at the moment it was added, so you can see what was being
+>   discussed right then even if no note mentions it. A Note or Timeline line
+>   may also link to one inline (`[name](assets/name)`) — that means the file
+>   is directly relevant to what's being said at that timestamp."""
 
 
 # ── device discovery ────────────────────────────────────────────────────────
@@ -665,6 +667,9 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
             self._attachments[name] = self._assets_dir / name
             self._attach_list.insert("end", name)
             self._log(f"Attached: {name}  (reference it in a note as /{name})", "SYS")
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            link = f"[{name}](assets/{quote(name)})"
+            self._events.append({"ts": ts, "kind": "attachment", "label": "📎 Attachment", "text": link})
 
     # ── notes + /filename autocomplete ───────────────────────────────────────
 
