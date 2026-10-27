@@ -70,7 +70,7 @@ loopback mode; microphones are captured directly. See *Known limitations* below.
 **Option A — prebuilt executable:** download the `Transcriber-windows` zip from
 the latest [GitHub Actions "Build Windows executable" run](../../actions)
 (Artifacts section), extract it anywhere, and run `Transcriber.exe` inside.
-Keep the `_internal` folder next to it. No Python install needed. The `small`
+Keep the `_internal` folder next to it. No Python install needed. The `base`
 Whisper model is bundled, so it works offline right away with no first-run
 download (other sizes still download on first use). Sessions are saved in a
 `sessions` folder next to the exe.

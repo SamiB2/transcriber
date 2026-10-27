@@ -42,7 +42,7 @@ SILENCE_RMS = 0.005
 # unpack dir (which is a temp folder for --onefile and _internal/ for --onedir).
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 SESSIONS_DIR = APP_DIR / "sessions"
-# Models shipped with the app (the Windows build bundles `small`), so they load
+# Models shipped with the app (the Windows build bundles `base`), so they load
 # offline with no first-use download. PyInstaller unpacks data under _MEIPASS.
 BUNDLED_MODELS_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "models"
 
@@ -77,6 +77,11 @@ MD_PREAMBLE = """\
 # {"name": str, "desc": str, "monitor": bool}, and StreamWorker.source stays a
 # plain string, so the GUI (mic-vs-speaker split, palettes) is untouched.
 
+# Why the last device listing failed, if it did, so the GUI can show it rather
+# than just presenting an empty device list.
+device_error: str | None = None
+
+
 def get_sources() -> list[dict]:
     return _get_sources_windows() if IS_WINDOWS else _get_sources_linux()
 
@@ -95,10 +100,16 @@ def get_defaults() -> tuple[str, str]:
 # it. tkinterdnd2 needs the GUI thread to stay single-threaded COM for OLE drag
 # and drop, so soundcard is only ever imported and used off the GUI thread.
 
-def _com_init_thread() -> None:
-    """Join this thread to the multithreaded COM apartment soundcard expects."""
+def _soundcard():
+    """Import soundcard and join this thread to the multithreaded COM apartment.
+
+    The import must come first: soundcard's import-time CoInitializeEx treats
+    S_FALSE ("already initialised on this thread") as an error and fails.
+    """
     import ctypes
+    import soundcard
     ctypes.windll.ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+    return soundcard
 
 
 def _off_gui_thread(fn):
@@ -106,7 +117,6 @@ def _off_gui_thread(fn):
 
     def run():
         try:
-            _com_init_thread()
             result.append((True, fn()))
         except Exception as e:
             result.append((False, e))
@@ -123,8 +133,10 @@ def _off_gui_thread(fn):
 
 
 def _get_sources_windows() -> list[dict]:
+    global device_error
+
     def query():
-        import soundcard as sc
+        sc = _soundcard()
         mics = [{"name": f"in:{m.id}", "desc": m.name, "monitor": False}
                 for m in sc.all_microphones()]
         spks = [{"name": f"out:{s.id}", "desc": f"{s.name}  (system audio)", "monitor": True}
@@ -132,14 +144,17 @@ def _get_sources_windows() -> list[dict]:
         return mics + spks
 
     try:
-        return _off_gui_thread(query)
-    except Exception:
+        sources = _off_gui_thread(query)
+    except Exception as e:
+        device_error = f"Could not list audio devices: {e!r}"
         return []
+    device_error = None
+    return sources
 
 
 def _get_defaults_windows() -> tuple[str, str]:
     def query():
-        import soundcard as sc
+        sc = _soundcard()
         mic, spk = sc.default_microphone(), sc.default_speaker()
         return (f"in:{mic.id}" if mic else "", f"out:{spk.id}" if spk else "")
 
@@ -229,8 +244,7 @@ class StreamWorker:
     def _run_windows(self):
         kind, _, dev_id = self.source.partition(":")
         try:
-            _com_init_thread()
-            import soundcard as sc
+            sc = _soundcard()
             # A speaker's loopback is opened as a "microphone" on the same endpoint.
             dev = sc.get_microphone(dev_id, include_loopback=(kind == "out"))
             # WASAPI resamples to 16 kHz for us; downmix to mono below.
@@ -493,13 +507,14 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         dev_frame.columnconfigure(1, weight=1)
 
         self._preselect()
+        self.after(0, self._report_device_error)
 
         # Settings frame
         cfg_frame = tb.Labelframe(self, text="Settings", bootstyle="secondary", padding=14)
         cfg_frame.pack(fill="x", **pad)
 
         tb.Label(cfg_frame, text="Model:").grid(row=0, column=0, sticky="w")
-        self._model_var = tk.StringVar(value="small" if _bundled_model_path("small") else "base")
+        self._model_var = tk.StringVar(value="base")  # the size the Windows build bundles
         tb.Combobox(
             cfg_frame, textvariable=self._model_var, bootstyle="info",
             values=["tiny", "base", "small", "medium", "large-v3"],
@@ -636,6 +651,11 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         self._build_spk_checks()
         self._preselect()
         self._log("Device list refreshed.", "SYS")
+        self._report_device_error()
+
+    def _report_device_error(self):
+        if device_error:
+            self._log(device_error, "ERR")
 
     def _track_all(self):
         for var in self._mic_vars.values():

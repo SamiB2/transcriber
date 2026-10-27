@@ -14,8 +14,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller
-      # Bundle the `small` model so the exe works offline out of the box.
-      - run: python -c "from faster_whisper.utils import download_model; download_model('small', output_dir='models/small')"
+      # Bundle the `base` model so the exe works offline out of the box.
+      - run: python -c "from faster_whisper.utils import download_model; download_model('base', output_dir='models/base')"
       # --onedir (exe + _internal/ folder) starts instantly; --onefile would
       # unpack the whole app and model to a temp folder on every launch.
       - run: pyinstaller --onedir --windowed --name Transcriber --collect-all tkinterdnd2 --collect-all ctranslate2 --collect-all faster_whisper --collect-all ttkbootstrap --collect-all certifi --collect-all soundcard --add-data "models;models" transcribe.py
