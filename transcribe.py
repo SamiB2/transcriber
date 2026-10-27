@@ -30,9 +30,18 @@ from ttkbootstrap.widgets.scrolled import ScrolledText
 
 IS_WINDOWS = platform.system() == "Windows"
 SAMPLE_RATE = 16000
-CHUNK_SEC = 5
+# Audio is cut into chunks at a natural pause between these lengths, so words
+# aren't split across chunks; a chunk is forced at MAX if nobody pauses.
+MIN_CHUNK_SEC = 4
+MAX_CHUNK_SEC = 8
+PAUSE_FRAME_SEC = 0.1
+PAUSE_RATIO = 0.3      # a frame this quiet relative to the chunk's RMS counts as a pause
+MAX_BACKLOG = 3        # chunks queued per stream before the oldest is dropped
 SILENCE_RMS = 0.005
-SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+# A frozen build lives next to its exe; sessions go there, not into PyInstaller's
+# unpack dir (which is a temp folder for --onefile and _internal/ for --onedir).
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+SESSIONS_DIR = APP_DIR / "sessions"
 # Models shipped with the app (the Windows build bundles `small`), so they load
 # offline with no first-use download. PyInstaller unpacks data under _MEIPASS.
 BUNDLED_MODELS_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "models"
@@ -182,11 +191,18 @@ class StreamWorker:
         self.out_q = out_q
         self._stop_event = threading.Event()
         self._proc: subprocess.Popen | None = None
-        self._lock = threading.Lock()           # guards _buf (Windows path)
-        self._buf: np.ndarray | None = None
+        self._lock = threading.Lock()           # guards _pending (Windows path)
+        self._pending: list[np.ndarray] = []
+        self._buf = np.empty(0, dtype=np.float32)
+        # One transcriber thread per stream with a bounded queue: lines stay in
+        # order, and a CPU that can't keep up drops old audio instead of piling
+        # up threads and lagging further behind.
+        self._chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=MAX_BACKLOG)
+        self._warned_backlog = False
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._transcribe_loop, daemon=True).start()
 
     def _run(self):
         (self._run_windows if IS_WINDOWS else self._run_linux)()
@@ -218,12 +234,10 @@ class StreamWorker:
         channels = dev["max_output_channels"] if kind == "out" else dev["max_input_channels"]
         channels = max(1, int(channels))
 
-        self._buf = np.empty(0, dtype=np.float32)
-
         def callback(indata, frames, time_info, status):
             mono = indata.mean(axis=1) if indata.ndim > 1 else indata
             with self._lock:
-                self._buf = np.concatenate((self._buf, mono.astype(np.float32)))
+                self._pending.append(mono.astype(np.float32))
 
         def open_stream(rate):
             # auto_convert lets WASAPI shared mode resample to 16kHz for us.
@@ -246,26 +260,18 @@ class StreamWorker:
                 self.out_q.put(("ERR", f"[{self.label}] stream error: {e}"))
                 return
 
-        chunk_len = rate * CHUNK_SEC
         try:
             with stream:
                 while not self._stop_event.is_set():
                     time.sleep(0.1)
-                    while True:
-                        with self._lock:
-                            if len(self._buf) < chunk_len:
-                                break
-                            chunk = self._buf[:chunk_len].copy()
-                            self._buf = self._buf[chunk_len:]
-                        threading.Thread(
-                            target=self._transcribe, args=(chunk,), daemon=True
-                        ).start()
+                    with self._lock:
+                        pending, self._pending = self._pending, []
+                    if pending:
+                        self._feed(np.concatenate(pending), rate)
         except Exception as e:
             self.out_q.put(("ERR", f"[{self.label}] stream error: {e}"))
 
     def _run_linux(self):
-        chunk_samples = SAMPLE_RATE * CHUNK_SEC
-        bytes_needed = chunk_samples * 4  # float32
         cmd = [
             "parec", f"--device={self.source}",
             "--rate", str(SAMPLE_RATE), "--channels", "1",
@@ -277,16 +283,47 @@ class StreamWorker:
             self.out_q.put(("ERR", f"[{self.label}] stream error: {e}"))
             return
 
-        buf = bytearray()
+        leftover = b""  # a read can end mid-sample
         while not self._stop_event.is_set():
-            raw = self._proc.stdout.read(65536)
+            raw = self._proc.stdout.read1(65536)
             if not raw:
                 break
-            buf.extend(raw)
-            while len(buf) >= bytes_needed:
-                chunk = np.frombuffer(bytes(buf[:bytes_needed]), dtype=np.float32).copy()
-                del buf[:bytes_needed]
-                threading.Thread(target=self._transcribe, args=(chunk,), daemon=True).start()
+            raw = leftover + raw
+            usable = len(raw) - len(raw) % 4
+            leftover = raw[usable:]
+            if usable:
+                self._feed(np.frombuffer(raw[:usable], dtype=np.float32), SAMPLE_RATE)
+
+    def _feed(self, samples: np.ndarray, rate: int):
+        """Append captured audio and queue every complete chunk it now holds."""
+        self._buf = np.concatenate((self._buf, samples))
+        while (cut := _find_cut(self._buf, rate)) is not None:
+            self._enqueue(self._buf[:cut].copy())
+            self._buf = self._buf[cut:]
+
+    def _enqueue(self, chunk: np.ndarray):
+        try:
+            self._chunks.put_nowait(chunk)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._chunks.get_nowait()  # drop the oldest so the transcript stays live
+        except queue.Empty:
+            pass
+        self._chunks.put_nowait(chunk)
+        if not self._warned_backlog:
+            self._warned_backlog = True
+            self.out_q.put(("ERR", f"[{self.label}] CPU can't keep up — skipping some audio. "
+                                   "Try a smaller model or fewer sources."))
+
+    def _transcribe_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                chunk = self._chunks.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._transcribe(chunk)
 
     def _transcribe(self, chunk: np.ndarray):
         if self._stop_event.is_set():
@@ -294,7 +331,9 @@ class StreamWorker:
         if float(np.sqrt(np.mean(chunk**2))) < SILENCE_RMS:
             return
         try:
-            segments, _ = self.model.transcribe(chunk, vad_filter=True)
+            # Greedy decoding (beam_size=1) is ~2-3x faster than the default
+            # beam of 5 for a small accuracy cost — worth it for live captions.
+            segments, _ = self.model.transcribe(chunk, beam_size=1, vad_filter=True)
             text = " ".join(s.text for s in segments).strip()
         except Exception as e:
             self.out_q.put(("ERR", f"[{self.label}] transcribe error: {e}"))
@@ -309,6 +348,30 @@ class StreamWorker:
 def _bundled_model_path(name: str) -> Path | None:
     path = BUNDLED_MODELS_DIR / name
     return path if (path / "model.bin").is_file() else None
+
+
+def _find_cut(buf: np.ndarray, rate: int) -> int | None:
+    """Where to end the next chunk of `buf`, or None to wait for more audio.
+
+    Cuts mid-way through the first pause after MIN_CHUNK_SEC; with no pause,
+    at the quietest frame once MAX_CHUNK_SEC of audio has built up.
+    """
+    lo, hi = MIN_CHUNK_SEC * rate, MAX_CHUNK_SEC * rate
+    frame = int(rate * PAUSE_FRAME_SEC)
+    n = (min(len(buf), hi) - lo) // frame
+    if n <= 0:
+        return None
+    frames = buf[lo:lo + n * frame].reshape(n, frame)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    level = float(np.sqrt(np.mean(buf[:lo + n * frame] ** 2)))
+    quiet = np.flatnonzero(rms < max(PAUSE_RATIO * level, SILENCE_RMS))
+    if quiet.size:
+        i = int(quiet[0])
+    elif len(buf) >= hi:
+        i = int(np.argmin(rms))
+    else:
+        return None
+    return lo + i * frame + frame // 2
 
 
 # ── model-download progress hook ─────────────────────────────────────────────
