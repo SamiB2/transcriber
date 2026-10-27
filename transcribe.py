@@ -869,7 +869,13 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         lines.append("")
 
         md_path = session_dir / "transcript.md"
-        md_path.write_text("\n".join(lines))
+        # Explicit UTF-8: Windows defaults to cp1252, which can't encode the
+        # 📝/📎 emoji used above.
+        try:
+            md_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError as e:
+            self._log(f"Could not export {md_path}: {e}", "ERR")
+            return None
         self._log(f"Exported: {md_path}", "SYS")
         return md_path
 
