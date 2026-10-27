@@ -14,6 +14,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -32,6 +33,9 @@ SAMPLE_RATE = 16000
 CHUNK_SEC = 5
 SILENCE_RMS = 0.005
 SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+# Models shipped with the app (the Windows build bundles `small`), so they load
+# offline with no first-use download. PyInstaller unpacks data under _MEIPASS.
+BUNDLED_MODELS_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "models"
 
 MIC_PALETTE = ["#4fc3f7", "#ffca28", "#ba68c8", "#ff8a65", "#aed581", "#f06292", "#90a4ae"]
 SPEAKER_PALETTE = ["#00897b", "#26a69a", "#43a047", "#7cb342", "#00acc1", "#5c6bc0", "#8d6e63"]
@@ -302,6 +306,11 @@ class StreamWorker:
         self.out_q.put((self.label, line))
 
 
+def _bundled_model_path(name: str) -> Path | None:
+    path = BUNDLED_MODELS_DIR / name
+    return path if (path / "model.bin").is_file() else None
+
+
 # ── model-download progress hook ─────────────────────────────────────────────
 # faster-whisper downloads the CTranslate2 snapshot via huggingface_hub's
 # snapshot_download on first use of a given size — but it *deliberately* passes
@@ -450,7 +459,7 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         cfg_frame.pack(fill="x", **pad)
 
         tb.Label(cfg_frame, text="Model:").grid(row=0, column=0, sticky="w")
-        self._model_var = tk.StringVar(value="base")
+        self._model_var = tk.StringVar(value="small" if _bundled_model_path("small") else "base")
         tb.Combobox(
             cfg_frame, textvariable=self._model_var, bootstyle="info",
             values=["tiny", "base", "small", "medium", "large-v3"],
@@ -839,7 +848,9 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
                 # Re-use cached model when name hasn't changed
                 if self._model is None or getattr(self._model, "_name", "") != model_name:
                     _install_download_progress_hook(self._dl_queue)
-                    m = WhisperModel(model_name, device="cpu", compute_type="int8")
+                    bundled = _bundled_model_path(model_name)
+                    m = WhisperModel(str(bundled) if bundled else model_name,
+                                     device="cpu", compute_type="int8")
                     m._name = model_name  # type: ignore[attr-defined]
                     self._model = m
             except Exception as e:
