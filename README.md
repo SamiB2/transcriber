@@ -89,8 +89,10 @@ python transcribe.py
 1. Launch the app. It lists your microphones and your speakers/outputs.
 2. Tick the sources you want (or hit **🔴 Track All**), pick a Whisper model,
    and press **▶ Start**. The first use of a given model size downloads it once.
-3. Talk / play the call. Lines appear in the transcript, labelled and coloured
-   per source.
+3. Talk / play the call. While recording, a blinking **● REC** shows next to
+   the Stop button and each source gets a live level bar, so you can see audio
+   is coming in. Lines appear in the transcript, labelled and coloured per
+   source.
 4. Type notes in the Notes box as you go; reference a dropped-in file with `/`.
 5. Press **■ Stop** (or **📄 Export Notes**) — a `transcript.md` and `assets/`
    folder are written under `sessions/`. Hand that folder to an AI to build

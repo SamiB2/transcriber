@@ -221,6 +221,7 @@ class StreamWorker:
         # up threads and lagging further behind.
         self._chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=MAX_BACKLOG)
         self._warned_backlog = False
+        self.level = 0.0  # RMS of the latest captured audio, read by the GUI's level meter
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -287,6 +288,8 @@ class StreamWorker:
 
     def _feed(self, samples: np.ndarray, rate: int):
         """Append captured audio and queue every complete chunk it now holds."""
+        if samples.size:
+            self.level = float(np.sqrt(np.mean(samples ** 2)))
         self._buf = np.concatenate((self._buf, samples))
         while (cut := _find_cut(self._buf, rate)) is not None:
             self._enqueue(self._buf[:cut].copy())
@@ -565,6 +568,14 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
         self._save_btn.pack(side="left", padx=4)
         self._status = tb.Label(btn_bar, text="", bootstyle="secondary")
         self._status.pack(side="left", padx=10)
+
+        # Live input-level meters, one row per recording source — slotted in the
+        # pack order now and filled on Start, like dl_frame above.
+        self._meter_frame = tb.Frame(self)
+        self._meter_frame.pack(fill="x", padx=16)
+        self._meters: list[tuple[StreamWorker, tb.Progressbar]] = []
+        self._meter_levels: list[float] = []
+        self._meter_job: str | None = None
 
         # Notes — packed to the bottom edge *before* the expanding Transcript frame below,
         # so it keeps a fixed height instead of being squeezed out by log_frame's expand=True.
@@ -951,19 +962,61 @@ class App(tb.Window, TkinterDnD.DnDWrapper):
             w = StreamWorker(src, label, self._model, self._q)
             w.start()
             self._workers.append(w)
+            self._add_meter(w, is_mic)
 
         self._btn.config(state="normal", text="■  Stop", bootstyle="danger")
-        self._set_status("Listening…")
+        self.title("● Recording — Transcriber")
         self._log("Started — speak or play audio.", "SYS")
+        self._tick_meters()
 
     def _stop(self):
         for w in self._workers:
             w.stop()
         self._workers.clear()
+        self._clear_meters()
         self._btn.config(text="▶  Start", bootstyle="success")
+        self.title("Transcriber")
+        self._status.config(bootstyle="secondary")
         self._set_status("")
         self._log("Stopped.", "SYS")
         self._export_markdown(silent=True)
+
+    # ── recording indicator + level meters ──────────────────────────────────
+
+    def _add_meter(self, worker: StreamWorker, is_mic: bool):
+        row = tb.Frame(self._meter_frame)
+        row.pack(fill="x", pady=1)
+        tb.Label(row, text=("🎤 " if is_mic else "🔊 ") + worker.label,
+                 width=40, anchor="w").pack(side="left")
+        bar = tb.Progressbar(row, bootstyle="success", maximum=100, value=0)
+        bar.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._meters.append((worker, bar))
+        self._meter_levels.append(0.0)
+
+    def _clear_meters(self):
+        if self._meter_job is not None:
+            self.after_cancel(self._meter_job)
+            self._meter_job = None
+        for child in self._meter_frame.winfo_children():
+            child.destroy()
+        self._meter_frame.configure(height=1)  # an emptied frame otherwise keeps its old height
+        self._meters.clear()
+        self._meter_levels.clear()
+
+    def _tick_meters(self):
+        if not self._workers:
+            return
+        for i, (worker, bar) in enumerate(self._meters):
+            # dBFS mapped onto 0-100 over a -60..0 dB range; fast attack, slow
+            # decay so speech reads as a steady bar rather than flicker.
+            db = 20 * np.log10(worker.level + 1e-9)
+            pct = float(np.clip((db + 60) / 60 * 100, 0, 100))
+            self._meter_levels[i] = max(pct, self._meter_levels[i] * 0.8)
+            bar.configure(value=self._meter_levels[i])
+        # Blink the status twice a second: a clear "this is recording" cue.
+        on = int(time.monotonic() * 2) % 2 == 0
+        self._status.config(text="● REC" if on else "○ REC", bootstyle="danger")
+        self._meter_job = self.after(100, self._tick_meters)
 
     # ── queue poll ────────────────────────────────────────────────────────────
 
