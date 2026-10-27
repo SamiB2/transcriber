@@ -41,7 +41,7 @@ transcript, so you can see who-said-what across the mic and the call.
 
 - Python 3.12
 - A few Python packages (see `requirements.txt`): `faster-whisper`, `numpy`,
-  `ttkbootstrap`, `tkinterdnd2`, and — on Windows only — `sounddevice`.
+  `ttkbootstrap`, `tkinterdnd2`, and — on Windows only — `soundcard`.
 
 ### Linux (validated)
 
@@ -63,8 +63,8 @@ python transcribe.py
 
 ### Windows
 
-Windows capture uses [`sounddevice`](https://python-sounddevice.readthedocs.io/)
-(PortAudio, WASAPI). System audio is captured by opening an output device in
+Windows capture uses [`soundcard`](https://github.com/bastibe/SoundCard)
+(WASAPI). System audio is captured by recording an output device in
 loopback mode; microphones are captured directly. See *Known limitations* below.
 
 **Option A — prebuilt executable:** download the `Transcriber-windows` zip from
@@ -108,15 +108,11 @@ machine.
 
 ## Known limitations
 
-- **Windows audio backend is unverified on real hardware.** The Windows capture
-  path is implemented against the documented `sounddevice`/PortAudio (WASAPI)
-  API and the CI build confirms it imports and bundles cleanly, but it has not
-  yet been run on a real Windows machine to confirm mic and system-audio
-  (loopback) capture actually work end to end. If something's off on Windows,
-  please [open an issue](../../issues). The Linux path is validated.
-- No audio resampling: if a device rejects 16 kHz, the app falls back to the
-  device's native sample rate, which can affect transcription quality in that
-  (rare) case.
+- **Windows audio is lightly tested.** The first Windows test run showed the
+  original `sounddevice` backend couldn't capture system audio (loopback) or
+  some mics; it now uses `soundcard`, which records WASAPI endpoints directly.
+  If something's off on Windows, please [open an issue](../../issues). The
+  Linux path is validated.
 
 ## License
 

@@ -73,7 +73,7 @@ MD_PREAMBLE = """\
 
 # ── device discovery ────────────────────────────────────────────────────────
 # Dispatch on OS: Linux uses PipeWire/PulseAudio (pactl/parec); Windows uses
-# sounddevice (PortAudio, WASAPI). The dict shape is identical on both paths:
+# soundcard (WASAPI). The dict shape is identical on both paths:
 # {"name": str, "desc": str, "monitor": bool}, and StreamWorker.source stays a
 # plain string, so the GUI (mic-vs-speaker split, palettes) is untouched.
 
@@ -85,59 +85,68 @@ def get_defaults() -> tuple[str, str]:
     return _get_defaults_windows() if IS_WINDOWS else _get_defaults_linux()
 
 
-# ── Windows backend (sounddevice / WASAPI) ──────────────────────────────────
-# sounddevice is imported lazily inside these functions so this file still runs
-# on Linux without the package installed at all.
+# ── Windows backend (soundcard / WASAPI) ────────────────────────────────────
+# soundcard talks to WASAPI directly and supports loopback capture of an output
+# device (system audio), which PortAudio/sounddevice can't do. Sources are
+# "in:<id>" for mics and "out:<id>" for a speaker's loopback, where <id> is the
+# WASAPI endpoint id.
 #
-# NOTE ON WASAPI LOOPBACK (system-audio capture): the current sounddevice (0.5.5)
-# has no `WasapiSettings(loopback=True)`, and its bundled PortAudio exposes no
-# loopback stream flag. Instead that PortAudio build captures system audio by
-# opening an *output/render* endpoint as an InputStream (it also ships
-# `PaWasapi_IsLoopback`). So a "system audio" source is encoded as "out:<index>"
-# and, in StreamWorker._run_windows, opened as an InputStream on that output
-# device. Mic sources are "in:<index>". This path is written against the
-# documented sounddevice/PortAudio API but is NOT verified on real Windows
-# hardware — see README "Known limitations".
+# soundcard initialises COM (multithreaded) on whichever thread first imports
+# it. tkinterdnd2 needs the GUI thread to stay single-threaded COM for OLE drag
+# and drop, so soundcard is only ever imported and used off the GUI thread.
 
-def _wasapi_hostapi_index(sd) -> int | None:
-    for i, ha in enumerate(sd.query_hostapis()):
-        if "WASAPI" in ha["name"]:
-            return i
-    return None
+def _com_init_thread() -> None:
+    """Join this thread to the multithreaded COM apartment soundcard expects."""
+    import ctypes
+    ctypes.windll.ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+
+
+def _off_gui_thread(fn):
+    result: list = []
+
+    def run():
+        try:
+            _com_init_thread()
+            result.append((True, fn()))
+        except Exception as e:
+            result.append((False, e))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    if not result:
+        raise TimeoutError("audio device query timed out")
+    ok, value = result[0]
+    if not ok:
+        raise value
+    return value
 
 
 def _get_sources_windows() -> list[dict]:
-    import sounddevice as sd
+    def query():
+        import soundcard as sc
+        mics = [{"name": f"in:{m.id}", "desc": m.name, "monitor": False}
+                for m in sc.all_microphones()]
+        spks = [{"name": f"out:{s.id}", "desc": f"{s.name}  (system audio)", "monitor": True}
+                for s in sc.all_speakers()]
+        return mics + spks
 
-    hostapi = _wasapi_hostapi_index(sd)
-    if hostapi is None:
+    try:
+        return _off_gui_thread(query)
+    except Exception:
         return []
-    sources = []
-    for idx, d in enumerate(sd.query_devices()):
-        if d["hostapi"] != hostapi:
-            continue
-        if d["max_input_channels"] > 0:
-            sources.append({"name": f"in:{idx}", "desc": d["name"], "monitor": False})
-        if d["max_output_channels"] > 0:
-            sources.append(
-                {"name": f"out:{idx}", "desc": f"{d['name']}  (system audio)", "monitor": True}
-            )
-    return sources
 
 
 def _get_defaults_windows() -> tuple[str, str]:
-    import sounddevice as sd
+    def query():
+        import soundcard as sc
+        mic, spk = sc.default_microphone(), sc.default_speaker()
+        return (f"in:{mic.id}" if mic else "", f"out:{spk.id}" if spk else "")
 
-    idx = _wasapi_hostapi_index(sd)
-    if idx is None:
+    try:
+        return _off_gui_thread(query)
+    except Exception:
         return "", ""
-    ha = sd.query_hostapis(idx)
-    din = ha.get("default_input_device", -1)
-    dout = ha.get("default_output_device", -1)
-    return (
-        f"in:{din}" if din is not None and din >= 0 else "",
-        f"out:{dout}" if dout is not None and dout >= 0 else "",
-    )
 
 
 # ── Linux backend (PipeWire via pactl) ──────────────────────────────────────
@@ -191,8 +200,6 @@ class StreamWorker:
         self.out_q = out_q
         self._stop_event = threading.Event()
         self._proc: subprocess.Popen | None = None
-        self._lock = threading.Lock()           # guards _pending (Windows path)
-        self._pending: list[np.ndarray] = []
         self._buf = np.empty(0, dtype=np.float32)
         # One transcriber thread per stream with a bounded queue: lines stay in
         # order, and a CPU that can't keep up drops old audio instead of piling
@@ -220,54 +227,24 @@ class StreamWorker:
                     pass
 
     def _run_windows(self):
-        import sounddevice as sd
-
-        kind, _, idx_s = self.source.partition(":")
+        kind, _, dev_id = self.source.partition(":")
         try:
-            idx = int(idx_s)
-            dev = sd.query_devices(idx)
+            _com_init_thread()
+            import soundcard as sc
+            # A speaker's loopback is opened as a "microphone" on the same endpoint.
+            dev = sc.get_microphone(dev_id, include_loopback=(kind == "out"))
+            # WASAPI resamples to 16 kHz for us; downmix to mono below.
+            rec = dev.recorder(samplerate=SAMPLE_RATE, channels=dev.channels)
         except Exception as e:
             self.out_q.put(("ERR", f"[{self.label}] device error: {e}"))
             return
-        # Loopback capture must match the render device's native channel count;
-        # a mic uses its input channel count. Downmix to mono in the callback.
-        channels = dev["max_output_channels"] if kind == "out" else dev["max_input_channels"]
-        channels = max(1, int(channels))
-
-        def callback(indata, frames, time_info, status):
-            mono = indata.mean(axis=1) if indata.ndim > 1 else indata
-            with self._lock:
-                self._pending.append(mono.astype(np.float32))
-
-        def open_stream(rate):
-            # auto_convert lets WASAPI shared mode resample to 16kHz for us.
-            return sd.InputStream(
-                device=idx, channels=channels, samplerate=rate, dtype="float32",
-                callback=callback, extra_settings=sd.WasapiSettings(auto_convert=True),
-            )
 
         try:
-            rate = SAMPLE_RATE
-            stream = open_stream(rate)
-        except Exception:
-            # ponytail: accept the device's native rate if 16kHz is rejected; no
-            # resampler is built, so whisper (which assumes 16kHz) will be off-
-            # pitch/speed in that rare case — upgrade path is a resampler here.
-            try:
-                rate = int(dev["default_samplerate"]) or SAMPLE_RATE
-                stream = open_stream(rate)
-            except Exception as e:
-                self.out_q.put(("ERR", f"[{self.label}] stream error: {e}"))
-                return
-
-        try:
-            with stream:
+            with rec:
                 while not self._stop_event.is_set():
-                    time.sleep(0.1)
-                    with self._lock:
-                        pending, self._pending = self._pending, []
-                    if pending:
-                        self._feed(np.concatenate(pending), rate)
+                    data = rec.record(numframes=SAMPLE_RATE // 10)
+                    mono = data.mean(axis=1) if data.ndim > 1 else data
+                    self._feed(mono.astype(np.float32), SAMPLE_RATE)
         except Exception as e:
             self.out_q.put(("ERR", f"[{self.label}] stream error: {e}"))
 

@@ -10,4 +10,4 @@ faster-whisper
 numpy
 ttkbootstrap
 tkinterdnd2
-sounddevice; platform_system == "Windows"
+soundcard>=0.4.3; platform_system == "Windows"
